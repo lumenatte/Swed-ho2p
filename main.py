@@ -10,11 +10,17 @@ from datetime import datetime, timezone, timedelta
 from xvfbwrapper import Xvfb
 from DrissionPage import ChromiumPage, ChromiumOptions
 
+# ==============================================================================
+# 语音识别核心依赖检查
+# ==============================================================================
 try:
     import speech_recognition as sr
     from pydub import AudioSegment
-except ImportError:
-    pass
+except ImportError as e:
+    print(f"[ERROR] 缺少必要的语音识别库: {e}")
+    print("[ERROR] 请在终端运行以下命令安装依赖：")
+    print("pip install SpeechRecognition pydub requests")
+    sys.exit(1)
 
 # ==============================================================================
 # 配置区域
@@ -83,7 +89,6 @@ def get_expire_time(page):
             return ele.text.strip()
     except Exception:
         pass
-    # 回退：源版的方式
     selectors = ['text:Expires in:', 'text:Deletes on:']
     for selector in selectors:
         try:
@@ -142,19 +147,15 @@ def restart_warp():
     except Exception:
         old_ip = "未知"
     try:
-        subprocess.run(["sudo", "warp-cli", "--accept-tos", "disconnect"],
-                      check=False, timeout=30, capture_output=True)
+        subprocess.run(["sudo", "warp-cli", "--accept-tos", "disconnect"], check=False, timeout=30, capture_output=True)
         time.sleep(3)
         try:
-            subprocess.run(["sudo", "warp-cli", "--accept-tos", "registration", "delete"],
-                          check=True, timeout=30, capture_output=True)
+            subprocess.run(["sudo", "warp-cli", "--accept-tos", "registration", "delete"], check=True, timeout=30, capture_output=True)
         except subprocess.CalledProcessError:
             log("删除注册失败（可能未注册）", "WARN")
-        subprocess.run(["sudo", "warp-cli", "--accept-tos", "registration", "new"],
-                      check=True, timeout=30, capture_output=True)
+        subprocess.run(["sudo", "warp-cli", "--accept-tos", "registration", "new"], check=True, timeout=30, capture_output=True)
         time.sleep(3)
-        subprocess.run(["sudo", "warp-cli", "--accept-tos", "connect"],
-                      check=True, timeout=30, capture_output=True)
+        subprocess.run(["sudo", "warp-cli", "--accept-tos", "connect"], check=True, timeout=30, capture_output=True)
         time.sleep(10)
         new_ip = requests.get("https://api.ipify.org", timeout=10).text
         log(f"WARP 重连成功，新 IP: {new_ip}")
@@ -164,7 +165,7 @@ def restart_warp():
         return False
 
 # ==============================================================================
-# reCAPTCHA 辅助函数
+# reCAPTCHA 辅助函数与语音识别优化
 # ==============================================================================
 def find_recaptcha_frame(page, kind):
     try:
@@ -381,21 +382,33 @@ def download_audio(url):
             pass
     return None
 
+# ==============================================================================
+# 语音识别核心修改点：加入详细异常抛出与日志输出
+# ==============================================================================
 def recognize_audio(mp3_path):
+    wav_path = mp3_path.replace(".mp3", ".wav")
     try:
-        wav_path = mp3_path.replace(".mp3", ".wav")
+        # pydub 转换格式（系统必须安装有 ffmpeg）
         AudioSegment.from_mp3(mp3_path).export(wav_path, format="wav")
+        
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_path) as src:
             audio_data = recognizer.record(src)
+            # 调用谷歌内置识别
             text = recognizer.recognize_google(audio_data)
-        try:
-            os.remove(wav_path)
-        except Exception:
-            pass
         return text
-    except Exception:
+    except FileNotFoundError:
+        log("语音转换失败：系统可能未安装 'ffmpeg'。请在系统环境中安装 ffmpeg 软件。", "ERROR")
         return None
+    except Exception as e:
+        log(f"语音识别接口调用发生错误: {e}", "WARN")
+        return None
+    finally:
+        if os.path.exists(wav_path):
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
 
 def solve_recaptcha(page):
     start = time.time()
@@ -452,6 +465,7 @@ def solve_recaptcha(page):
         except Exception:
             pass
         if not text:
+            log("语音未能正确识别成文字，刷新验证码重试...", "WARN")
             reload_challenge(page)
             time.sleep(3)
             continue
@@ -466,7 +480,7 @@ def solve_recaptcha(page):
     raise RuntimeError("验证码达到最大尝试次数")
 
 # ==============================================================================
-# 单个 URL 续期流程（去掉 IP 预检，直接尝试 + 封锁换 IP）
+# 单个 URL 续期流程
 # ==============================================================================
 def renew_single_url(url):
     success = False
@@ -500,14 +514,13 @@ def renew_single_url(url):
                 co.set_argument('--window-size=1280,720')
                 co.set_argument('--log-level=3')
                 co.set_argument('--silent')
-                # 关键：每次用独立的用户数据目录，避免残留 cookie/指纹
+                
                 user_data_dir = tempfile.mkdtemp()
                 co.set_user_data_path(user_data_dir)
                 co.auto_port()
                 co.headless(False)
                 page = ChromiumPage(co)
 
-                # 反指纹注入
                 page.add_init_js("""
                     const getParameter = WebGLRenderingContext.prototype.getParameter;
                     WebGLRenderingContext.prototype.getParameter = function(parameter) {
@@ -528,7 +541,6 @@ def renew_single_url(url):
                 old_expire = get_expire_time(page)
                 log(f"服务器: {server_name}, 到期时间: {old_expire}")
 
-                # 清理遮挡广告
                 page.run_js("""
                     const cssSelectors = ['ins.adsbygoogle', 'iframe[src*="ads"]', '.modal-backdrop'];
                     cssSelectors.forEach(sel => {
@@ -541,7 +553,6 @@ def renew_single_url(url):
                     consent_btn.click()
                     time.sleep(3)
 
-                # 关键：积累真实的鼠标轨迹和滚动数据（源版有，新版删了）
                 for _ in range(3):
                     scroll_y = random.randint(200, 600)
                     page.scroll.down(scroll_y)
@@ -574,7 +585,6 @@ def renew_single_url(url):
                         renew_btn2.click(by_js=True)
                 time.sleep(random.uniform(7, 10))
 
-                # reCAPTCHA 破解
                 anchor_frame = find_recaptcha_frame(page, "anchor")
                 if not anchor_frame:
                     log("未检测到 reCAPTCHA，检查是否已直接成功")
